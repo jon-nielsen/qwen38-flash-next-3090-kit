@@ -3,13 +3,19 @@
 Profile B does NOT need this: it serves halt95's checkpoint as-is.
 Profile A's default does NOT need it either: the original checkpoint serves as-is
 on 8 GPUs (measured 2026-09-12: boots TP4×PP2+EP+MTP-4 at util 0.92, KV pool
-1,333,383 tokens = 5.09x @262k, P1 mean 104.2 tok/s under our quick meter).
+1,333,383 cold / 1,325,073 warm, P1 89.0 tok/s on prose probes and 104.2 on
+technical prompts, 4-stream aggregate 267 same-prompt / 192-253 distinct,
+acceptance 1.96 per draft, 4/4 oracle).
 
-Run this surgery ONLY for the optional max-multi-stream variant: it converts
-halt95's packed INT4 MTP draft-head experts to BF16 so the draft loads through the
-fork's unquantized-draft path. The BF16 draft accepts more, trading ~10% of the KV
-pool (1,213,265 tokens = 4.63x) for the series-measured maximum: P1 94.6 tok/s,
-4-stream aggregate 202.2 tok/s, acceptance ~3.5. Plain copies, no hardlinks.
+A same-meter A/B (2026-09-12, identical prompts, back-to-back boots) measured this
+surgery's output head-to-head against the original checkpoint and found it NOT
+faster: P1 89.3 vs 89.0, 4-stream 185-186 vs 267 (same-prompt) / 186 vs 192-253
+(distinct), acceptance 1.92 vs 1.96 — and the BF16 draft costs ~106k of KV pool
+(1,219,309-1,213,265 tokens = 4.63-4.65x vs 1,325,073). Run it ONLY to reproduce
+the series' bf16mtp lane verbatim (series: P1 94.6, 4-stream 202.2, acceptance
+~3.5 under its own prompts — a meter the original checkpoint was never run under).
+It converts halt95's packed INT4 MTP draft-head experts to BF16 so the draft loads
+through the fork's unquantized-draft path. Plain copies, no hardlinks.
 ~30 min on CPU, needs roughly 2x the checkpoint size in free disk
 (in ~116 GiB, out ~119 GiB).
 

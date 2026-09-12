@@ -27,10 +27,10 @@ MODEL=/path/to/merlin VLLM_API_KEY=yourkey \
 docker logs -f flashnext-3090-4gpu-262k   # ~5-6 min cold; success line: "GPU KV cache size: 416,490 tokens"
 
 # Profile A — 8x RTX 3090, max capacity/speed (same checkpoint, no surgery;
-# the surgery in surgery/ is an OPTIONAL max-multi-stream variant, see below)
+# the surgery in surgery/ is a measured optional variant — NOT faster, see below)
 MODEL=/path/to/merlin VLLM_API_KEY=yourkey \
   docker compose -f profile-a-8gpu-tp4pp2-mtp4-bf16kv.yml up -d
-docker logs -f flashnext-3090-8gpu   # ~10 min cold; success line: "GPU KV cache size: 1,333,383 tokens"
+docker logs -f flashnext-3090-8gpu   # ~10 min cold / ~4 min warm; success line: "GPU KV cache size: ~1,333,383 tokens" (±0.6% boot-to-boot; warm boots land ~1,325,073)
 ```
 
 Both profiles expect the image at
@@ -45,9 +45,9 @@ The tag is the runtime fork commit + the base-image digest all measurements ran 
 | Context | 262,144 | 262,144 |
 | KV cache | BF16 | FP8 E4M3 + calibrated sidecar |
 | Draft head | INT4 packed (halt95's original) | INT4 packed (halt95's original) |
-| KV pool | 1,333,383 tokens (5.09x) | 416,490 tokens (1.59x) |
-| Single-stream | 104.2 tok/s (quick meter) | 94.2 tok/s |
-| 4-stream aggregate | 146.5 / 131.5 tok/s (quick meter) | 189.3 tok/s |
+| KV pool | 1,333,383 tokens cold / 1,325,073 warm (5.05-5.09x) | 416,490 tokens (1.59x) |
+| Single-stream | 89.0 tok/s (series-replica meter; 104.2 on a 1024-tok technical quick meter) | 94.2 tok/s (series meter) |
+| 4-stream aggregate | 267 tok/s same-prompt x4, 192-253 distinct prompts (series-replica meter) | 189.3 tok/s (series meter) |
 | Checkpoint | halt95's, as-is | halt95's, as-is |
 
 Profile B is the interesting one: full-context serving on four 24 GB cards, at
@@ -55,17 +55,29 @@ single-stream parity with the 8-GPU lane. At C=1 the lane is communication-laten
 bound and TP2×PP2's 24 two-rank allreduces per stage beat TP4's 48 four-rank ones —
 the GPU count is not the limit, the shape is.
 
-### Profile A variant: bf16mtp (optional surgery)
+### Profile A variant: bf16mtp (optional surgery — measured, not faster)
 
-The surgery in `surgery/` dequantizes the draft head to BF16. It shrinks the KV
-pool ~10% (1,213,265 tokens / 4.63x) in exchange for a higher-accepting draft: the
-series-measured lane on the bf16mtp checkpoint recorded P1 94.6 tok/s, 4-stream
-aggregate 202.2 tok/s, acceptance ~3.5. The default (original-checkpoint) lane was
-validated 2026-09-12 with a shorter quick meter on technical prompts: P1
-96.7/123.8/92.2 (mean 104.2), 4-stream 146.5/131.5, acceptance 1.74 per draft.
-The meters and prompt sets differ — do not compare the aggregates cross-lane. If
-you serve many concurrent streams and want the series-measured maximum, run the
-surgery once (~30 min CPU) and point MODEL at its output; the compose is unchanged.
+The surgery in `surgery/` dequantizes the draft head to BF16. It was built because
+the series predates the INT4-draft path on this lane; the series measured it at P1
+94.6, 4-stream 202.2, acceptance ~3.5 under its own prompts. A same-meter A/B
+(2026-09-12: identical prose probes, back-to-back boots, series-replica protocol)
+then measured BOTH checkpoints head-to-head:
+
+| Same-meter A/B | Original (default) | bf16mtp (surgery) |
+|---|---|---|
+| P1 single-stream | 89.0 tok/s | 89.3 tok/s |
+| 4-stream, same prompt x4 | 267 / 266 / 273 tok/s | 185 / 186 tok/s |
+| 4-stream, 4 distinct prompts | 192 / 253 tok/s | 186 / 186 tok/s |
+| Acceptance per draft | 1.96 | 1.92 |
+| KV pool | 1,325,073 (warm boot) | 1,219,309 |
+
+The original checkpoint matched or beat the surgery output on every axis while
+keeping ~106k more KV pool (8.7%). The series' 202.2 / acceptance-3.5 figures were
+prompt-set-dependent (the original checkpoint was never run under that meter), and
+on matched prompts the two drafts accept equally — there is no measured case where
+the surgery pays. It is kept for reproducibility of the series numbers and as a
+verified INT4->BF16 dequant tool; to reproduce the series lane verbatim, run it
+once (~30 min CPU) and point MODEL at its output; the compose is unchanged.
 
 ## Rig constraints that are baked into these profiles (do not remove)
 
@@ -88,12 +100,22 @@ surgery once (~30 min CPU) and point MODEL at its output; the compose is unchang
 - FP8-KV acceptance is ~3.0 under load vs ~3.5 BF16 — inside the band halt95 reports
   for the same design (2.43-2.78). Inherent FP8 numerics, not a port defect; it is
   the price of the 1.59x pool at 262k.
-- Profile A's default-lane numbers (P1 104.2, 4-stream 146.5/131.5, acceptance
-  1.74/draft) come from a short quick meter with technical/code prompts; the bf16mtp
-  variant's 202.2 aggregate came from the longer series meter. The 4-prompt quality
-  oracle was run on the bf16mtp and Profile B lanes; the original-checkpoint
-  Profile A lane passed boot, throughput, and acceptance probes (2026-09-12) but
-  not the oracle.
+- KV pool varies ~0.6% boot-to-boot (memory-profiler variance): original lane
+  1,333,383 cold / 1,325,073 warm; bf16mtp 1,213,265 (series) / 1,219,309.
+- Multi-stream runs on Profile A show run-to-run variance on both checkpoints
+  (C=2 per-stream bimodal 59-83 tok/s; one distinct-prompt C=4 round measured 192
+  then 253 within a minute). Medians are reported; the mechanism was not pinned.
+- The 4-prompt quality oracle has been run on all three lanes, including the
+  original-checkpoint Profile A (2026-09-12): 4/4 correct; prompt 0
+  bitwise-identical to the bf16mtp lane; prompts 1/3 tail-drift (epsilon class,
+  cap-truncated long reasoning); prompt 2 correct with a differently-phrased
+  Europa fact. The bf16mtp lane reproduced the series' M-R6 oracle bitwise on
+  anchor prompts 0 and 2 (greedy, capture = reasoning + content) — the published
+  lane IS the series lane, end to end (baked image, derived compose, real-file
+  mounts).
+- Single-stream prompt sensitivity is real: the default lane reads 89.0 on
+  512-token prose probes and 104.2 mean on 1024-token technical prompts. Pick the
+  meter closest to your workload when comparing.
 - Deep prefill tested to 68k tokens; 131k-class depth untested on Profile B.
 - Output correctness was gated with a 4-prompt oracle (bitwise where numerics allow,
   semantic otherwise): 4/4 correct on both measured lanes, and the FP8 lanes match the

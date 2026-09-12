@@ -1,11 +1,14 @@
 # Profile A — 8x RTX 3090 (24 GB, sm_86, PCIe only): max capacity/speed.
 # DEFAULT: halt95's checkpoint AS-IS — no surgery. Measured 2026-09-12:
-#   KV pool 1,333,383 (5.09x @262k), P1 mean 104.2 tok/s (quick meter, 1024-tok
-#   gens, technical prompts: 96.7/123.8/92.2), acceptance 1.74/draft on those
-#   prompts. Success line: "GPU KV cache size: 1,333,383 tokens" (~10 min cold).
-# OPTIONAL VARIANT (max multi-stream, series-measured): bf16mtp checkpoint via
-#   surgery/ — P1 94.6, 4-stream aggregate 202.2, KV pool 1,213,265 (4.63x),
-#   acceptance ~3.5. Meters differ; see README before comparing.
+#   KV pool 1,333,383 cold / 1,325,073 warm (5.05-5.09x @262k), P1 89.0 tok/s
+#   (512-tok prose probes; 104.2 mean on 1024-tok technical prompts), 4-stream
+#   aggregate 267 same-prompt / 192-253 distinct, acceptance 1.96/draft, 4/4
+#   oracle. Success line: "GPU KV cache size: ~1,333,383 tokens" (~10 min cold,
+#   ~4 min warm; ±0.6% boot-to-boot).
+# OPTIONAL VARIANT (measured, NOT faster — kept for series reproducibility):
+#   bf16mtp checkpoint via surgery/ — same-meter A/B: P1 89.3, 4-stream 185-186,
+#   acceptance 1.92, KV pool 1,219,309. The series' own prompts measured it at
+#   P1 94.6 / 4-stream 202.2 / acceptance ~3.5; see README.
 # PP REQUIRES the NCCL_P2P_DISABLE/VLLM_SKIP_P2P_CHECK/disable-custom-all-reduce trio below.
 # Run:
 #   cd <this-repo>/composes && MODEL=/path/to/merlin-checkpoint VLLM_API_KEY=... \

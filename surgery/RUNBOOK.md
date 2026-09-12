@@ -1,12 +1,20 @@
-# Surgery runbook — bf16mtp checkpoint (needed for Profile A only)
+# Surgery runbook — bf16mtp checkpoint (OPTIONAL Profile A variant)
 
 Profile B does NOT need this: it serves halt95's checkpoint as-is.
-This converts halt95's packed INT4 MTP draft-head experts to BF16 so the draft loads
-through the fork's unquantized-draft path. Plain copies, no hardlinks. ~30 min on
-CPU, needs roughly 2x the checkpoint size in free disk (in ~116 GiB, out ~119 GiB).
+Profile A's default does NOT need it either: the original checkpoint serves as-is
+on 8 GPUs (measured 2026-09-12: boots TP4×PP2+EP+MTP-4 at util 0.92, KV pool
+1,333,383 tokens = 5.09x @262k, P1 mean 104.2 tok/s under our quick meter).
+
+Run this surgery ONLY for the optional max-multi-stream variant: it converts
+halt95's packed INT4 MTP draft-head experts to BF16 so the draft loads through the
+fork's unquantized-draft path. The BF16 draft accepts more, trading ~10% of the KV
+pool (1,213,265 tokens = 4.63x) for the series-measured maximum: P1 94.6 tok/s,
+4-stream aggregate 202.2 tok/s, acceptance ~3.5. Plain copies, no hardlinks.
+~30 min on CPU, needs roughly 2x the checkpoint size in free disk
+(in ~116 GiB, out ~119 GiB).
 
 The scripts are byte-identical to the ones that produced and verified the
-measurements in the README — they use module-level constants instead of CLI flags,
+published measurements — they use module-level constants instead of CLI flags,
 so you edit three paths instead of passing arguments.
 
 ## 1. Edit the constants
@@ -38,5 +46,6 @@ python3 -m venv .venv && .venv/bin/pip install torch safetensors numpy  # CPU to
 
 ## 4. Serve
 
-Point Profile A's `MODEL` at the DST dir. (The config ignore list is collapsed to
-`re:^mtp\..*` by the script — that is the load path the measurements used.)
+Point Profile A's `MODEL` at the DST dir (instead of halt95's original) — the
+compose is unchanged. (The config ignore list is collapsed to `re:^mtp\..*` by the
+script — that is the load path the series measurements used.)

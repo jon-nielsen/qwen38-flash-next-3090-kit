@@ -1,10 +1,14 @@
 # Profile A — 8x RTX 3090 (24 GB, sm_86, PCIe only): max capacity/speed.
-# Measured (2026-09-11, rig: 4x16+4x8 risers, no NVLink, P2P blocked by BAR1 VBIOS):
-#   P1 94.6 tok/s single-stream, 4-stream aggregate 202.2, KV pool 1,213,265 (4.63x @262k).
-# Requires the bf16mtp checkpoint (surgery/ in this repo run once on halt95's checkpoint).
+# DEFAULT: halt95's checkpoint AS-IS — no surgery. Measured 2026-09-12:
+#   KV pool 1,333,383 (5.09x @262k), P1 mean 104.2 tok/s (quick meter, 1024-tok
+#   gens, technical prompts: 96.7/123.8/92.2), acceptance 1.74/draft on those
+#   prompts. Success line: "GPU KV cache size: 1,333,383 tokens" (~10 min cold).
+# OPTIONAL VARIANT (max multi-stream, series-measured): bf16mtp checkpoint via
+#   surgery/ — P1 94.6, 4-stream aggregate 202.2, KV pool 1,213,265 (4.63x),
+#   acceptance ~3.5. Meters differ; see README before comparing.
 # PP REQUIRES the NCCL_P2P_DISABLE/VLLM_SKIP_P2P_CHECK/disable-custom-all-reduce trio below.
 # Run:
-#   cd <this-repo>/composes && MODEL=/path/to/bf16mtp-checkpoint VLLM_API_KEY=... \
+#   cd <this-repo>/composes && MODEL=/path/to/merlin-checkpoint VLLM_API_KEY=... \
 #     docker compose -f profile-a-8gpu-tp4pp2-mtp4-bf16kv.yml up -d
 services:
   vllm:

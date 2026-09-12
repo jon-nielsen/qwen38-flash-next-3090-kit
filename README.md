@@ -1,9 +1,10 @@
-# Qwen3.8-Flash-Next on 24 GB Ampere — serving kit (RTX 3090)
+# Qwen3.8-Flash-Next: full 262k context with MTP-4 on 4x RTX 3090 (24 GB) — serving kit
 
 Two measured launch profiles for serving **halt95/Qwen3.8-Flash-Next-W4A16-Merlin**
 (W4A16 quant of Qwen3.8-Flash-Next) on RTX 3090-class hardware, plus the runtime
-image and the checkpoint surgery tooling they rest on. Everything here was measured
-on a real rig — no estimates.
+image and the checkpoint surgery tooling they rest on. The headline result: the
+4-GPU profile serves the model at its full 262,144-token context with MTP-4.
+Everything here was measured on a real rig — no estimates.
 
 ## Quick start
 

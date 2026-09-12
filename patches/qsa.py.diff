@@ -1,5 +1,5 @@
---- /home/jon/vllm/vllm-backport/vllm/models/qwen4_exp/nvidia/qsa.py	2026-09-05 13:41:25.328423355 +0200
-+++ /home/jon/vllm/qwen38-flash-next/publish/qwen38-flash-next-3090-kit/overlay-fp8/qsa.py	2026-09-12 12:48:08.404396250 +0200
+--- a/vllm/models/qwen4_exp/nvidia/qsa.py
++++ b/overlay-fp8/qsa.py
 @@ -4,6 +4,11 @@
  
  from __future__ import annotations

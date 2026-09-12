@@ -1,5 +1,5 @@
---- /home/jon/vllm/vllm-backport/vllm/models/qwen4_exp/nvidia/model.py	2026-09-05 13:41:25.327655116 +0200
-+++ /home/jon/vllm/qwen38-flash-next/publish/qwen38-flash-next-3090-kit/overlay-fp8/model.py	2026-09-12 12:48:08.404511932 +0200
+--- a/vllm/models/qwen4_exp/nvidia/model.py
++++ b/overlay-fp8/model.py
 @@ -5,6 +5,8 @@
  from collections.abc import Iterable
  from itertools import islice

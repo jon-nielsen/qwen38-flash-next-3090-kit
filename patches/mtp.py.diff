@@ -1,5 +1,5 @@
---- /home/jon/vllm/vllm-backport/vllm/models/qwen4_exp/nvidia/mtp.py	2026-09-05 13:41:25.327820535 +0200
-+++ /home/jon/vllm/qwen38-flash-next/publish/qwen38-flash-next-3090-kit/overlay-fp8/mtp.py	2026-09-12 12:48:08.404559982 +0200
+--- a/vllm/models/qwen4_exp/nvidia/mtp.py
++++ b/overlay-fp8/mtp.py
 @@ -133,23 +133,37 @@
                  _remap_ignored_layers(exclude_modules, mtp_start_layer_idx),
              )

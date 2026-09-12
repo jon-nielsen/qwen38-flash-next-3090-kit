@@ -1,5 +1,5 @@
---- /home/jon/vllm/vllm-backport/vllm/models/qwen4_exp/nvidia/ple_layer.py	2026-09-05 13:41:25.328240695 +0200
-+++ /home/jon/vllm/qwen38-flash-next/publish/qwen38-flash-next-3090-kit/overlay/ple_layer.py	2026-09-12 12:48:08.403074444 +0200
+--- a/vllm/models/qwen4_exp/nvidia/ple_layer.py
++++ b/overlay/ple_layer.py
 @@ -3,6 +3,7 @@
  """GPU-resident Qwen4Exp position-learning enhancement layers."""
  

@@ -1,0 +1,77 @@
+# Profile A — 8x RTX 3090 (24 GB, sm_86, PCIe only): max capacity/speed.
+# Measured (2026-09-11, rig: 4x16+4x8 risers, no NVLink, P2P blocked by BAR1 VBIOS):
+#   P1 94.6 tok/s single-stream, 4-stream aggregate 202.2, KV pool 1,213,265 (4.63x @262k).
+# Requires the bf16mtp checkpoint (surgery/ in this repo run once on halt95's checkpoint).
+# PP REQUIRES the NCCL_P2P_DISABLE/VLLM_SKIP_P2P_CHECK/disable-custom-all-reduce trio below.
+# Run:
+#   cd <this-repo>/composes && MODEL=/path/to/bf16mtp-checkpoint VLLM_API_KEY=... \
+#     docker compose -f profile-a-8gpu-tp4pp2-mtp4-bf16kv.yml up -d
+services:
+  vllm:
+    image: ghcr.io/jon-nielsen/vllm-backport-flashnext-sm86:3bec275-bb1f7777
+    container_name: flashnext-3090-8gpu
+    ports:
+      - "8000:8000"
+    devices:
+      - nvidia.com/gpu=all
+    shm_size: "32g"
+    restart: unless-stopped
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      - CUDA_VISIBLE_DEVICES=0,1,2,7,3,4,5,6
+      - VLLM_PLE_CPU_OFFLOAD=1
+      - VLLM_PLE_FP8_EMBEDDING=1
+      - NCCL_ALGO=Ring
+      - NCCL_PROTO=LL128
+      - NCCL_P2P_DISABLE=1
+      - VLLM_SKIP_P2P_CHECK=1
+      - TRITON_CACHE_DIR=/root/cache/triton
+      - TORCHINDUCTOR_CACHE_DIR=/root/cache/torchinductor
+      - VLLM_CACHE_ROOT=/root/cache/vllm
+      - CUDA_CACHE_PATH=/root/cache/nvidia-cuda
+      - TORCH_EXTENSIONS_DIR=/root/cache/torch_extensions
+    volumes:
+      - ${MODEL}:/model:ro
+      - hf-cache:/root/.cache/huggingface
+      - flashnext-cache-triton:/root/cache/triton
+      - flashnext-cache-torchinductor:/root/cache/torchinductor
+      - flashnext-cache-vllm:/root/cache/vllm
+      - flashnext-cache-nvidia-cuda:/root/cache/nvidia-cuda
+      - flashnext-cache-torch_extensions:/root/cache/torch_extensions
+    command: |
+      --model /model
+      --served-model-name Qwen3.8-Flash-Next
+      --api-key ${VLLM_API_KEY}
+      --tensor-parallel-size 4
+      --pipeline-parallel-size 2
+      --enable-expert-parallel
+      --gpu-memory-utilization 0.92
+      --max-model-len 262144
+      --max-num-seqs 32
+      --max-num-batched-tokens 4096
+      --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32], "max_cudagraph_capture_size": 32}'
+      --speculative-config '{"method": "mtp", "num_speculative_tokens": 4}'
+      --disable-custom-all-reduce
+      --enable-prefix-caching
+      --mamba-cache-mode align
+      --reasoning-parser qwen3
+      --tool-call-parser qwen3_coder
+      --enable-auto-tool-choice
+      --default-chat-template-kwargs '{"reasoning_effort": "medium"}'
+      --trust-remote-code
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 900s
+      timeout: 10s
+      retries: 3
+      start_period: 1200s
+volumes:
+  hf-cache:
+  flashnext-cache-triton:
+  flashnext-cache-torchinductor:
+  flashnext-cache-vllm:
+  flashnext-cache-nvidia-cuda:
+  flashnext-cache-torch_extensions:

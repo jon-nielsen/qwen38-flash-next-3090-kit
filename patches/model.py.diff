@@ -1,0 +1,84 @@
+--- /home/jon/vllm/vllm-backport/vllm/models/qwen4_exp/nvidia/model.py	2026-09-05 13:41:25.327655116 +0200
++++ /home/jon/vllm/qwen38-flash-next/publish/qwen38-flash-next-3090-kit/overlay-fp8/model.py	2026-09-12 12:48:08.404511932 +0200
+@@ -5,6 +5,8 @@
+ from collections.abc import Iterable
+ from itertools import islice
+ 
++import os
++
+ import torch
+ from torch import nn
+ 
+@@ -70,6 +72,7 @@
+ from vllm.transformers_utils.configs.qwen4_exp import (
+     Qwen4ExpTextConfig,
+ )
++from vllm.logger import init_logger
+ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+ from vllm.v1.kv_cache_interface import MambaSpec
+ 
+@@ -77,7 +80,9 @@
+ from .hyperconnection import GatedResidual, HyperConnectionConfig
+ from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
+ from .ple_layer import Qwen4ExpPLELayer
+-from .qsa import Qwen4ExpQSAAttention
++from .qsa import Qwen4ExpQSAAttention, load_qsa_static_kv_scales
++
++logger = init_logger(__name__)
+ 
+ 
+ def without_modelopt_fp4(
+@@ -819,6 +824,42 @@
+         return self.ctx.get_hf_config(Qwen4ExpConfig)
+ 
+ 
++_QSA_KV_SCALES_ENV = "VLLM_QSA_KV_SCALES"
++
++
++def _maybe_load_qsa_static_kv_scales(model: nn.Module) -> None:
++    """Apply a static QSA K/V scale sidecar when VLLM_QSA_KV_SCALES names one.
++
++    ``load_qsa_static_kv_scales()`` shipped with no call site anywhere, so every
++    FP8 KV deployment ran at the vLLM default scale of 1.0 with no supported way
++    to change it -- a loader nothing invokes is not an integration, it is dead
++    code that reads like one. This is the call site, placed where the loader's
++    own docstring requires: after checkpoint weights are loaded, before
++    profiling, warmup or cudagraph capture.
++
++    Unset env var -> no-op, and the attention layer logs the default 1.0 per
++    layer so the uncalibrated state stays visible. Set but unusable -> the
++    exception propagates rather than being swallowed: a calibration that was
++    requested and silently not applied is worse than one never requested,
++    because the operator then believes scales are in force that are not.
++    """
++    path = os.environ.get(_QSA_KV_SCALES_ENV, "").strip()
++    if not path:
++        return
++    # strict: every QSA layer of the target model must be in the sidecar. An empty or
++    # partial file silently leaving layers at scale 1.0 is exactly the failure this
++    # call site exists to prevent.
++    applied = load_qsa_static_kv_scales(model, path, strict=True)
++    shown = ", ".join(sorted(applied)[:4])
++    logger.info(
++        "Qwen4Exp QSA: applied static K/V scales from %s to %d layer(s): %s%s",
++        path,
++        len(applied),
++        shown,
++        " ..." if len(applied) > 4 else "",
++    )
++
++
+ @MULTIMODAL_REGISTRY.register_processor(
+     Qwen3VLMultiModalProcessor,
+     info=Qwen4ExpProcessingInfo,
+@@ -1005,7 +1046,9 @@
+             self,
+             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
+         )
+-        return loader.load_weights(weights, mapper=mapper)
++        loaded = loader.load_weights(weights, mapper=mapper)
++        _maybe_load_qsa_static_kv_scales(self)
++        return loaded
+ 
+     @classmethod
+     def get_mamba_state_dtype_from_config(

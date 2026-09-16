@@ -2,7 +2,7 @@
 
 Two measured launch profiles for serving **halt95/Qwen3.8-Flash-Next-W4A16-Merlin**
 (W4A16 quant of Qwen3.8-Flash-Next) on RTX 3090-class hardware, plus the runtime
-image recipe and the optional checkpoint surgery tooling. The headline result: the
+image recipe. The headline result: the
 4-GPU profile serves the model at its full 262,144-token context with MTP-4.
 Everything here was measured on a real rig — no estimates. Both profiles run on
 halt95's checkpoint exactly as downloaded.
@@ -14,33 +14,15 @@ verbatim under the [`v1` tag](../../tree/v1).
 
 ## Quick start
 
-Requirements: NVIDIA GPUs (24 GB, sm_86), Docker + nvidia-container-toolkit with CDI
-(`nvidia-ctk cdi generate`), ~46-51 GiB free host RAM for the CPU-offloaded FP8 PLE
-table, disk for the checkpoint (~116 GiB download + workspace).
+Serving is front-doored through the HF kit — it carries the composes and the
+consumer walk-through (requirements, checkpoint download, kit download,
+`docker compose up`, success lines):
 
-```bash
-# 1. checkpoint (the only large download)
-hf download halt95/Qwen3.8-Flash-Next-W4A16-Merlin --local-dir /path/to/merlin
+https://huggingface.co/Jon-Nielsen/Qwen3.8-Flash-Next-Merlin-3090-Serving-Kit
 
-# 2. this kit
-git clone https://github.com/jon-nielsen/qwen38-flash-next-3090-kit
-cd qwen38-flash-next-3090-kit/composes
-
-# 3. Profile B — 4x RTX 3090, full 262,144-token context (recommended)
-MODEL=/path/to/merlin VLLM_API_KEY=yourkey \
-  docker compose -f profile-b-4gpu-tp2pp2-mtp4-262k-fp8kv.yml up -d
-docker logs -f flashnext-3090-4gpu-262k   # ~15 min cold (Triton/inductor compile), ~4.5 min warm;
-                                          # success line: "GPU KV cache size: 438,539 tokens"
-
-# Profile A — 8x RTX 3090, max capacity (same checkpoint, no surgery)
-MODEL=/path/to/merlin VLLM_API_KEY=yourkey \
-  docker compose -f profile-a-8gpu-tp4pp2-mtp4-bf16kv.yml up -d
-docker logs -f flashnext-3090-8gpu   # ~7 min cold; success line: "GPU KV cache size: 1,317,519 tokens"
-```
-
-Both profiles pull `ghcr.io/jon-nielsen/vllm-backport-flashnext-sm86:2b21fbe-bfe237ee`
-(see "Image provenance" below; pin by digest
-`sha256:e88c57b4485ce2c577b283ec5de5ad02329953d0e62a94106980ede4a9e2fd45`).
+This repo is the build and provenance side: `Dockerfile` + `tree/` reproduce
+the runtime image `ghcr.io/jon-nielsen/vllm-backport-flashnext-sm86:2b21fbe-bfe237ee`
+(see "Image provenance and rebuild" below).
 
 ## The two profiles, as measured (v2)
 
@@ -91,24 +73,6 @@ DET=0 note: under DET=0 the 4-GPU lane alternates fast/slow decode passes
 (~215 floor / ~270 ceiling band structure, real and reproducible). Medians pool
 both bands; single-pass numbers are not comparable across arms.
 
-## Profile A variant: bf16mtp (optional surgery — measured, not faster)
-
-The surgery in `surgery/` dequantizes the draft head to BF16. It predates the
-INT4-draft path on this lane. The v1-era same-meter A/B (2026-09-12, identical
-prose probes, back-to-back boots) measured BOTH checkpoints head-to-head:
-
-| Same-meter A/B | Original (default) | bf16mtp (surgery) |
-|---|---|---|
-| P1 single-stream | 89.0 tok/s | 89.3 tok/s |
-| 4-stream, same prompt x4 | 267 / 266 / 273 tok/s | 185 / 186 tok/s |
-| 4-stream, 4 distinct prompts | 192 / 253 tok/s | 186 / 186 tok/s |
-| Acceptance per draft | 1.96 | 1.92 |
-| KV pool | 1,325,073 (warm boot) | 1,219,309 |
-
-No measured case where the surgery pays. It is kept for reproducibility of the
-v1 series numbers and as a verified INT4->BF16 dequant tool; to reproduce the
-v1-era series lane, run it once (~30 min CPU) and point MODEL at its output.
-
 ## Rig constraints that are baked into these profiles (do not remove)
 
 - **The PP trio** (`NCCL_P2P_DISABLE=1`, `VLLM_SKIP_P2P_CHECK=1`,
@@ -146,8 +110,9 @@ v1-era series lane, run it once (~30 min CPU) and point MODEL at its output.
 - Cross-day comparisons carry ~±10% day drift; same-day numbers above were
   measured back-to-back.
 - `restart: unless-stopped` is the only lifecycle change vs the measured configs;
-  engine arguments are untouched (the v2 composes differ from the measured lanes
-  only in image/container/port/naming and the `:?` key guard).
+  engine arguments are untouched (the shipped composes — in the HF serving kit —
+  differ from the measured lanes only in image/container/port/naming and the
+  `:?` key guard).
 
 ## The stack and who made it
 
@@ -164,17 +129,21 @@ v1-era series lane, run it once (~30 min CPU) and point MODEL at its output.
 | DET=0 default; pinned-PLE byte-move; PLE ignore-entry fix | fork master cde54e8ed3 (in the merged tree) | lazmio |
 | Draft-unquantized block (mtp.py) | fork commit | lazmio |
 | FP8 E4M3 QSA KV reader (Triton integer-decode, sm_86) | halt95 patches/0001, ported to v0.13 in the merged tree | halt95 (Apache-2.0) |
-| v0.13 rebase of the FP8-KV/QSA port + PP-aware sidecar loader fixes, PP KV-alloc cross-rank parity fix, INT4-draft probe gate, FP8-PLE embedding gate, merged-tree bake | this kit (patches-v2/, tree/) | Jon-Nielsen |
-| Draft INT4->BF16 surgery + fail-closed verifier (optional variant) | this kit (surgery/) | Jon-Nielsen |
-| Profiles, knob measurements, rig findings, 5-arm ladder, 8-GPU v2 validation, live-traffic shift | this kit (composes/) | Jon-Nielsen |
+| v0.13 rebase of the FP8-KV/QSA port + PP-aware sidecar loader fixes, PP KV-alloc cross-rank parity fix, INT4-draft probe gate, FP8-PLE embedding gate, merged-tree bake | this kit (tree/) | Jon-Nielsen |
+| Draft INT4->BF16 surgery + fail-closed verifier (optional variant) | this kit (tag v1, surgery/) | Jon-Nielsen |
+| Profiles, knob measurements, rig findings, 5-arm ladder, 8-GPU v2 validation, live-traffic shift | this kit (composes in the HF serving kit) | Jon-Nielsen |
 
 ## Image provenance and rebuild
 
 The v2 image = base `lazmio/vllm-backport@sha256:bfe237ee...` (the fork's v0.13.0
 sm_86 build) COPY-merged with the 11 files in `tree/` (10 vLLM runtime files +
-halt95's KV-scales sidecar to /opt). `patches-v2/` holds the exact per-file diffs
-of those files vs the v0.13.0 fork tag (a350766628): 10 diffs, +1337 lines total.
+halt95's KV-scales sidecar to /opt). Those 10 files are exactly what the image
+changes vs its base, so the full delta is reproducible from public materials:
+clone `wtdcode/vllm-backport` at tag `v0.13.0` (a350766628) and diff against
+`tree/vllm/` (e.g. `diff -ru <fork-clone>/vllm tree/vllm`).
 `Dockerfile` is the build; the OCI labels carry the full provenance.
+Published: `ghcr.io/jon-nielsen/vllm-backport-flashnext-sm86:2b21fbe-bfe237ee`,
+digest `sha256:e88c57b4485ce2c577b283ec5de5ad02329953d0e62a94106980ede4a9e2fd45`.
 
 Rebuild procedure (what was actually done for the published tag):
 
@@ -195,13 +164,20 @@ loop must skip non-local layer names. The v0.13 rebase additionally fixed
 KV-cache group allocation under PP (empty groups must be kept for cross-rank
 index parity and skipped in the tensor builder).
 
-## v1 (previous release)
+## v1 and the optional surgery (previous release)
 
 The v1 kit (fork 3bec27573, v0.11.3 line; image
 `ghcr.io/jon-nielsen/vllm-backport-flashnext-sm86:3bec275-bb1f7777`, still
 published and pinned) lives verbatim under the [`v1` git tag](../../tree/v1) —
-overlays, patches, Dockerfile and README as originally released. v1 measured:
-Profile B P1 94.2 / 4-stream 189.3 / pool 416,490; Profile A pool 1,333,383.
+overlays, patches, Dockerfile, composes, surgery and README as originally
+released. v1 measured: Profile B P1 94.2 / 4-stream 189.3 / pool 416,490;
+Profile A pool 1,333,383.
+
+Also under the tag: the optional bf16mtp draft-head surgery (`surgery/` there)
+— an INT4→BF16 dequant + fail-closed verifier, kept only to reproduce the v1
+series lane. The v1-era same-meter A/B (2026-09-12) found it NOT faster than
+halt95's original checkpoint: equal single-stream, slower multi-stream, and
+~106k less KV pool. Neither v2 profile needs it.
 
 ## License
 

@@ -41,8 +41,10 @@ the runtime image `ghcr.io/jon-nielsen/vllm-backport-flashnext-sm86:2b21fbe-bfe2
 Profile B is the default for the typical 2-4 concurrent-stream load: full context,
 best aggregate throughput per GPU, and it sustained a ~4h15m real-traffic shift
 with no restarts. Profile A is the capacity play: 3x the KV pool for deep-context
-or many parallel sessions, plus the best single-stream latency. Numbers are
-decode-only (768-token generations, temp 0, 12-pass pooled meter).
+or many parallel sessions, plus the best single-stream latency.
+
+All numbers were measured on RTX 3090s power-limited to 180 W (stock TDP:
+350 W), decode-only (768-token generations, temp 0, 12-pass pooled meter).
 
 ## What changed in v2 (and how it was validated)
 
@@ -50,7 +52,9 @@ The runtime moved from the fork's v0.11.3 line to its v0.13.0 line (base image
 `lazmio/vllm-backport@sha256:bfe237ee...`, fork tag v0.13.0 = a350766628), with
 our FP8-KV/QSA port rebased onto the v0.13 kernels and a merge of fork master
 (cde54e8ed3) that brings in Hauck's PP-rank and mamba-state fixes (#76/#77) and
-lazmio's `VLLM_DETERMINISTIC_MOE_ALIGN=0` default. The merge's single conflict
+lazmio's `VLLM_DETERMINISTIC_MOE_ALIGN=0` default.
+
+The merge's single conflict
 (ngram_embedding.py) resolved keep-ours: our fused FP8 UVA lookup kernel stays.
 
 A same-day 5-arm ladder on identical hardware isolated each change (TP2×PP2,
@@ -142,6 +146,7 @@ changes vs its base, so the full delta is reproducible from public materials:
 clone `wtdcode/vllm-backport` at tag `v0.13.0` (a350766628) and diff against
 `tree/vllm/` (e.g. `diff -ru <fork-clone>/vllm tree/vllm`).
 `Dockerfile` is the build; the OCI labels carry the full provenance.
+
 Published: `ghcr.io/jon-nielsen/vllm-backport-flashnext-sm86:2b21fbe-bfe237ee`,
 digest `sha256:e88c57b4485ce2c577b283ec5de5ad02329953d0e62a94106980ede4a9e2fd45`.
 

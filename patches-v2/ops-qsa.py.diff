@@ -1,0 +1,353 @@
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa.py b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+index 709acbde00..3991a0879b 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+@@ -10,14 +10,102 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+     TritonWarmupTensor,
+     triton_scalar_specialization_rep,
+ )
++from vllm.platforms import current_platform
+ from vllm.triton_utils import HAS_TRITON, tl, triton
+ 
++if HAS_TRITON:
++    from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_lut, get_e4m3fn_bf16_lut
++else:
++    # CPU-only / no-driver: fp8_sm80 does tl.constexpr() at import, which is
++    # None on the Triton placeholder. The LUT constructor is pure torch.
++    _decode_fp8_lut = None
++
++    def get_e4m3fn_bf16_lut(
++        device: torch.device, nan_value: float | None = None
++    ) -> torch.Tensor:
++        lut = (
++            torch.arange(256, dtype=torch.uint8, device=device)
++            .view(torch.float8_e4m3fn)
++            .to(torch.bfloat16)
++        )
++        if nan_value is not None:
++            lut[0x7F] = nan_value
++            lut[0xFF] = -nan_value
++        return lut
++
++# Overlay shift-mul decoded e4m3 NaN slots (0x7F/0xFF) to +-480, not NaN.
++# reshape_and_cache_flash is satfinite and never emits those codes; the LUT
++# still uses this magnitude so a calibrated sidecar stays numerically faithful
++# to the sm86-proven decoder.
++_QSA_E4M3_NAN_DECODE = 480.0
++_QSA_KV_DTYPE_BF16 = 0
++_QSA_KV_DTYPE_E4M3 = 1
++
++
++def _view_qsa_kv_as_triton_storage(
++    k_cache: torch.Tensor, v_cache: torch.Tensor
++) -> tuple[torch.Tensor, torch.Tensor, int]:
++    """Return K/V as Triton-legal storage plus a KV_DTYPE constexpr code.
++
++    E4M3 is always a uint8 view: Triton must never see an fp8e4nv pointer on
++    sm80/sm86. BF16 is unchanged (KV_DTYPE=0).
++    """
++    if k_cache.dtype != v_cache.dtype:
++        raise ValueError("QSA sparse attention requires matching K/V dtypes")
++    if k_cache.dtype == torch.bfloat16:
++        return k_cache, v_cache, _QSA_KV_DTYPE_BF16
++    fp8_dtype = current_platform.fp8_dtype()
++    if k_cache.dtype in (torch.uint8, fp8_dtype):
++        if k_cache.dtype == fp8_dtype:
++            k_cache = k_cache.view(torch.uint8)
++            v_cache = v_cache.view(torch.uint8)
++        return k_cache, v_cache, _QSA_KV_DTYPE_E4M3
++    raise ValueError(
++        "QSA supports only BF16 and uint8/E4M3 K/V caches, "
++        f"not {k_cache.dtype}"
++    )
++
++
++def _qsa_scale_and_lut_ptrs(
++    kv_dtype: int,
++    q: torch.Tensor,
++    k_scale: torch.Tensor | None,
++    v_scale: torch.Tensor | None,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Pointers the split-K kernel loads when KV_DTYPE != 0.
++
++    BF16 specializations compile those loads out; dummy pointers (the query)
++    keep the signature stable without allocating.
++    """
++    if kv_dtype == _QSA_KV_DTYPE_BF16:
++        return q, q, q
++    if k_scale is None:
++        k_scale = torch.tensor(1.0, dtype=torch.float32, device=q.device)
++    if v_scale is None:
++        v_scale = torch.tensor(1.0, dtype=torch.float32, device=q.device)
++    if (
++        k_scale.numel() != 1
++        or v_scale.numel() != 1
++        or k_scale.dtype != torch.float32
++        or v_scale.dtype != torch.float32
++        or k_scale.device != q.device
++        or v_scale.device != q.device
++    ):
++        raise ValueError(
++            "QSA K/V scales must be scalar float32 tensors on the query device"
++        )
++    lut = get_e4m3fn_bf16_lut(q.device, nan_value=_QSA_E4M3_NAN_DECODE)
++    return k_scale, v_scale, lut
++
+ 
+ @triton.jit(do_not_specialize=["num_rows", "num_requests"])
+ def _qsa_sparse_paged_gqa_splitk_kernel(
+     q_ptr,
+     k_cache_ptr,
+     v_cache_ptr,
++    k_scale_ptr,
++    v_scale_ptr,
++    lut_ptr,
+     indices_ptr,
+     block_table_ptr,
+     token_to_req_ptr,
+@@ -47,6 +135,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
+     NUM_QUERY_HEADS: tl.constexpr,
+     NUM_SPLITS: tl.constexpr,
+     NUM_TILES: tl.constexpr,
++    KV_DTYPE: tl.constexpr,
+     BLOCK_M: tl.constexpr,
+     BLOCK_N: tl.constexpr,
+ ) -> None:
+@@ -80,6 +169,10 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
+     accumulator = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
+     softmax_scale_log2: tl.constexpr = (HEAD_DIM**-0.5) * 1.4426950408889634
+ 
++    if KV_DTYPE != 0:
++        k_scale_value = tl.load(k_scale_ptr)
++        v_scale_value = tl.load(v_scale_ptr)
++
+     tile_end = tl.minimum(NUM_TILES, tl.cdiv(tl.minimum(valid_count, TOPK), BLOCK_N))
+ 
+     for tile in range(split_id, tile_end, NUM_SPLITS):
+@@ -108,33 +201,67 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
+         valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
+         # physical_page * block stride can overflow int32 for large caches.
+         safe_page = tl.maximum(physical_page, 0).to(tl.int64)
+-        keys = tl.load(
+-            k_cache_ptr
+-            + safe_page[None, :] * stride_k_block
+-            + page_offset[None, :] * stride_k_token
+-            + kv_head * stride_k_head
+-            + dim_offsets[:, None],
+-            mask=valid[None, :],
+-            other=0.0,
+-        )
+-        values = tl.load(
+-            v_cache_ptr
+-            + safe_page[:, None] * stride_v_block
+-            + page_offset[:, None] * stride_v_token
+-            + kv_head * stride_v_head
+-            + dim_offsets[None, :],
+-            mask=valid[:, None],
+-            other=0.0,
+-        )
++        if KV_DTYPE == 0:
++            keys = tl.load(
++                k_cache_ptr
++                + safe_page[None, :] * stride_k_block
++                + page_offset[None, :] * stride_k_token
++                + kv_head * stride_k_head
++                + dim_offsets[:, None],
++                mask=valid[None, :],
++                other=0.0,
++            )
++            values = tl.load(
++                v_cache_ptr
++                + safe_page[:, None] * stride_v_block
++                + page_offset[:, None] * stride_v_token
++                + kv_head * stride_v_head
++                + dim_offsets[None, :],
++                mask=valid[:, None],
++                other=0.0,
++            )
++        else:
++            key_bytes = tl.load(
++                k_cache_ptr
++                + safe_page[None, :] * stride_k_block
++                + page_offset[None, :] * stride_k_token
++                + kv_head * stride_k_head
++                + dim_offsets[:, None],
++                mask=valid[None, :],
++                other=0,
++            )
++            # UNSCALED: k_scale is folded into the score scaling below.
++            # USE_FNUZ=False: CUDA OCP e4m3fn. lut_ptr is the 256-entry bf16
++            # table with 0x7F/0xFF mapped to +-480 (overlay shift-mul).
++            keys = _decode_fp8_lut(key_bytes, False, lut_ptr).to(tl.bfloat16)
+         scores = tl.dot(query, keys)
+         # Scaling scores avoids re-quantizing a scaled query to BF16.
+-        scores *= softmax_scale_log2
++        if KV_DTYPE == 0:
++            scores *= softmax_scale_log2
++        else:
++            # k_scale is a scalar, so scaling each SCORE is equivalent to
++            # scaling every key element — but costs one multiply per score
++            # instead of one per element, and skips the fp32 round trip and
++            # the BF16 re-quantization of the scaled key.
++            scores *= softmax_scale_log2 * k_scale_value
+         scores = tl.where(valid[None, :], scores, -1.0e20)
+         next_max = tl.maximum(max_value, tl.max(scores, axis=1))
+         alpha = tl.math.exp2(max_value - next_max)
+         probabilities = tl.where(
+             valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
+         )
++        if KV_DTYPE != 0:
++            value_bytes = tl.load(
++                v_cache_ptr
++                + safe_page[:, None] * stride_v_block
++                + page_offset[:, None] * stride_v_token
++                + kv_head * stride_v_head
++                + dim_offsets[None, :],
++                mask=valid[:, None],
++                other=0,
++            )
++            # UNSCALED: v_scale is folded into the epilogue below.
++            values = _decode_fp8_lut(value_bytes, False, lut_ptr).to(tl.bfloat16)
+         accumulator = tl.dot(
+             probabilities.to(values.dtype),
+             values,
+@@ -149,6 +276,13 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
+         accumulator / tl.maximum(normalizer[:, None], 1.0e-20),
+         0.0,
+     )
++    if KV_DTYPE != 0:
++        # v_scale folded out of the per-element V decode: the attention output
++        # is linear in V, so one multiply per output element replaces one per
++        # cache element per tile. Safe under split-K too — every partial is
++        # scaled by the same constant before the LSE merge, which is itself
++        # linear in the partial outputs.
++        normalized_output *= v_scale_value
+     output_mask = head_offsets[:, None] < GROUP_SIZE
+     if NUM_SPLITS == 1:
+         tl.store(
+@@ -455,14 +589,24 @@ def qsa_sparse_paged_attention(
+     token_to_req: torch.Tensor,
+     use_prefill_config: bool,
+     out: torch.Tensor | None = None,
++    *,
++    k_scale: torch.Tensor | None = None,
++    v_scale: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+-    """Run sparse GQA directly over paged BF16 K/V caches.
++    """Run sparse GQA directly over paged BF16 or E4M3 K/V caches.
+ 
+     logical_indices is the PACKED selection buffer: [rows, selection_width + 1]
+     with the trailing column holding each row's valid-entry count (written by
+     the expand kernel; never a token index). The kernel reads it as the
+     tile-loop bound. use_prefill_config only steers the top of the config table; see
+     _select_config.
++
++    k_scale / v_scale are keyword-only so they cannot bind onto
++    use_prefill_config. They are compile-time dead for BF16. E4M3 storage is
++    viewed as uint8 so Triton never materializes fp8e4nv on sm80/sm86.
++
++    Hardware policy (E4M3 only on CUDA sm80/sm86) is enforced at
++    Qwen4ExpQSAAttention construction, not per launch.
+     """
+     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
+         raise ValueError("QSA sparse attention received invalid Q/K/V shapes")
+@@ -480,7 +624,9 @@ def qsa_sparse_paged_attention(
+         raise ValueError("QSA sparse attention requires valid grouped-query heads")
+     head_dim = q.shape[2]
+     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
+-    assert q.dtype == k_cache.dtype == v_cache.dtype == torch.bfloat16
++    if q.dtype != torch.bfloat16:
++        raise ValueError("QSA sparse attention requires BF16 queries")
++    k_cache, v_cache, kv_dtype = _view_qsa_kv_as_triton_storage(k_cache, v_cache)
+     assert logical_indices.dtype == block_table.dtype == torch.int32
+     assert token_to_req.dtype == torch.int32
+     assert q.device == k_cache.device == v_cache.device
+@@ -499,6 +645,10 @@ def qsa_sparse_paged_attention(
+     if not q.shape[0]:
+         return out
+ 
++    k_scale_ptr, v_scale_ptr, lut_ptr = _qsa_scale_and_lut_ptrs(
++        kv_dtype, q, k_scale, v_scale
++    )
++
+     group_size = q.shape[1] // k_cache.shape[2]
+     block_m = triton.next_power_of_2(group_size)
+     selection_width = logical_indices.shape[1] - 1  # trailing column is the count
+@@ -527,6 +677,9 @@ def qsa_sparse_paged_attention(
+         q,
+         k_cache,
+         v_cache,
++        k_scale_ptr,
++        v_scale_ptr,
++        lut_ptr,
+         logical_indices,
+         block_table,
+         token_to_req,
+@@ -556,6 +709,7 @@ def qsa_sparse_paged_attention(
+         NUM_QUERY_HEADS=q.shape[1],
+         NUM_SPLITS=num_splits,
+         NUM_TILES=num_tiles,
++        KV_DTYPE=kv_dtype,
+         BLOCK_M=block_m,
+         BLOCK_N=block_n,
+         num_warps=partial_warps,
+@@ -588,10 +742,17 @@ def warmup_qsa_sparse_paged_attention(
+     num_query_heads: int,
+     selection_width: int,
+ ) -> tuple[tuple[int, int, int], ...]:
+-    """Compile every production-reachable split-K/merge specialization."""
++    """Compile every production-reachable split-K/merge specialization.
++
++    KV_DTYPE follows the bound cache so an E4M3 (uint8-view) deployment
++    compiles the FP8 reader at boot rather than mid-request.
++    """
+ 
+     head_dim = kv_cache.shape[-1] // 2
+     key_cache, value_cache = kv_cache.transpose(1, 2).split(head_dim, dim=-1)
++    key_cache, value_cache, kv_dtype = _view_qsa_kv_as_triton_storage(
++        key_cache, value_cache
++    )
+     num_kv_heads = key_cache.shape[2]
+     group_size = num_query_heads // num_kv_heads
+     block_m = triton.next_power_of_2(group_size)
+@@ -621,6 +782,9 @@ def warmup_qsa_sparse_paged_attention(
+         shape=tuple(value_cache.shape),
+         strides=tuple(value_cache.stride()),
+     )
++    k_scale_ptr = TritonWarmupTensor(torch.float32, shape=(1,))
++    v_scale_ptr = TritonWarmupTensor(torch.float32, shape=(1,))
++    lut_ptr = TritonWarmupTensor(torch.bfloat16, shape=(256,))
+     # +1: the packed buffer's trailing count column.
+     indices_ptr = TritonWarmupTensor(torch.int32, shape=(num_rows, selection_width + 1))
+     block_table_ptr = TritonWarmupTensor(
+@@ -653,6 +817,9 @@ def warmup_qsa_sparse_paged_attention(
+             q_ptr,
+             k_cache_ptr,
+             v_cache_ptr,
++            k_scale_ptr,
++            v_scale_ptr,
++            lut_ptr,
+             indices_ptr,
+             block_table_ptr,
+             token_to_req_ptr,
+@@ -682,6 +849,7 @@ def warmup_qsa_sparse_paged_attention(
+             NUM_QUERY_HEADS=num_query_heads,
+             NUM_SPLITS=num_splits,
+             NUM_TILES=num_tiles,
++            KV_DTYPE=kv_dtype,
+             BLOCK_M=block_m,
+             BLOCK_N=block_n,
+             num_warps=warps,
+@@ -862,6 +1030,12 @@ def qsa_compress_groups_with_ratio(
+ 
+ 
+ __all__ = [
++    "_QSA_E4M3_NAN_DECODE",
++    "_QSA_KV_DTYPE_BF16",
++    "_QSA_KV_DTYPE_E4M3",
++    "_qsa_scale_and_lut_ptrs",
++    "_select_config",
++    "_view_qsa_kv_as_triton_storage",
+     "qsa_compress_groups_with_ratio",
+     "qsa_sparse_paged_attention",
+     "qsa_store_cache_rows",

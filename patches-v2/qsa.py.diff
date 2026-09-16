@@ -1,5 +1,7 @@
+diff --git a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
+index 90449d5706..b1b6afcf3c 100644
 --- a/vllm/models/qwen4_exp/nvidia/qsa.py
-+++ b/overlay-fp8/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/qsa.py
 @@ -4,6 +4,11 @@
  
  from __future__ import annotations
@@ -12,22 +14,25 @@
  from typing import ClassVar, cast
  
  import torch
-@@ -20,6 +25,7 @@
- from vllm.model_executor.layers.layernorm import GemmaRMSNorm
- from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
- from vllm.model_executor.layers.quantization import QuantizationConfig
+@@ -14,6 +19,7 @@ from vllm.config import VllmConfig
+ from vllm.config.cache import CacheDType
+ from vllm.distributed import get_tensor_model_parallel_world_size
+ from vllm.forward_context import get_forward_context
 +from vllm.logger import init_logger
- from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding, get_rope
- from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
- from vllm.platforms import current_platform
-@@ -58,6 +64,40 @@
+ from vllm.model_executor.layers.attention.attention import (
+     set_default_quant_scales,
+ )
+@@ -54,6 +60,44 @@ from . import model
  from .indexer_qsa import QSAIndexer
  
  
 +logger = init_logger(__name__)
 +
++# Main-KV E4M3 is validated only on Ampere (sm80/sm86). sm90+ has native FA
++# FP8 KV and must not silently take this Triton integer-decode path.
 +_QSA_FP8_CACHE_DTYPES = ("fp8", "fp8_e4m3")
 +_QSA_SUPPORTED_CACHE_DTYPES = ("auto", "bfloat16", *_QSA_FP8_CACHE_DTYPES)
++_QSA_FP8_CAPABILITIES = frozenset({80, 86})
 +
 +
 +def _is_qsa_fp8_cache_dtype(cache_dtype: str) -> bool:
@@ -46,12 +51,13 @@
 +        )
 +
 +    capability = current_platform.get_device_capability()
-+    if capability is None or capability.to_int() != 86:
++    cap_int = capability.to_int() if capability is not None else None
++    if cap_int not in _QSA_FP8_CAPABILITIES:
 +        cap_str = (
 +            capability.as_version_str() if capability is not None else "unknown"
 +        )
 +        raise ValueError(
-+            "Qwen4Exp QSA E4M3 KV cache is validated only on SM86, but "
++            "Qwen4Exp QSA E4M3 KV cache is validated only on SM80/SM86, but "
 +            f"{current_platform.get_device_name()} has compute capability "
 +            f"{cap_str}. Re-run with --kv-cache-dtype bfloat16."
 +        )
@@ -61,7 +67,7 @@
  class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
      """Flash metadata supporting uniform decode and target-verify graphs."""
  
-@@ -68,7 +108,12 @@
+@@ -64,7 +108,12 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
      """FullAttentionSpec backend used by the merged QSA owner."""
  
      supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
@@ -75,7 +81,7 @@
  
      @staticmethod
      def get_name() -> str:
-@@ -103,15 +148,36 @@
+@@ -99,15 +148,36 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
      supports_pcp: bool = False
  
      def __init__(self, *args, **kwargs) -> None:
@@ -83,7 +89,7 @@
 +        # forward_qsa -> qsa_sparse_paged_attention (our Triton sparse-GQA kernel)
 +        # and the cache write goes through the CUDA reshape_and_cache_flash op.
 +        # FlashAttentionImpl.__init__ nevertheless rejects any quantized KV dtype
-+        # that FA itself cannot read, and sm_86 has no FP8 FA kernel. Present
++        # that FA itself cannot read, and sm80/sm86 have no FP8 FA kernel. Present
 +        # "auto" to the base class, then restore the real dtype. The only other
 +        # kv_cache_dtype use in that constructor is an SM90/FA4 dequant path that
 +        # cannot trigger here, and supports_quant_query_input is set below anyway.
@@ -114,10 +120,10 @@
          self.supports_quant_query_input = False
  
      def forward_qsa(
-@@ -148,11 +214,42 @@
+@@ -143,11 +213,43 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+         logical_indices = topk_buffer[:num_tokens]
+         token_to_req = token_to_req[:num_tokens]
          key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
-         key_cache = canonicalize_singleton_dim_strides(key_cache)
-         value_cache = canonicalize_singleton_dim_strides(value_cache)
 -        if key_cache.dtype != torch.bfloat16 or query.dtype != torch.bfloat16:
 -            raise NotImplementedError("Qwen4Exp QSA requires BF16 Q/K/V")
 +        if query.dtype != torch.bfloat16:
@@ -152,25 +158,24 @@
 +                getattr(layer, "layer_name", "<unnamed>"),
 +                float(layer._k_scale),
 +                float(layer._v_scale),
-+                "" if float(layer._k_scale) != 1.0 or float(layer._v_scale) != 1.0
++                ""
++                if float(layer._k_scale) != 1.0 or float(layer._v_scale) != 1.0
 +                else "  (DEFAULT 1.0 -- no static calibration loaded)",
 +            )
 +
          qsa_sparse_paged_attention(
              query[:num_tokens],
              key_cache,
-@@ -160,7 +257,9 @@
-             logical_indices,
-             attn_metadata.block_table,
+@@ -157,6 +259,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
              token_to_req,
--            output[:num_tokens],
-+            out=output[:num_tokens],
+             use_prefill_config,
+             output[:num_tokens],
 +            k_scale=layer._k_scale,
 +            v_scale=layer._v_scale,
          )
          return output
  
-@@ -187,10 +286,20 @@
+@@ -183,10 +287,20 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
              raise ValueError("Qwen4Exp QSA requires a paged KV cache")
          if model_config.dtype != torch.bfloat16:
              raise NotImplementedError("Qwen4Exp QSA currently requires BF16")
@@ -195,7 +200,7 @@
          parallel_config = vllm_config.parallel_config
          if (
              parallel_config.prefill_context_parallel_size > 1
-@@ -282,10 +391,23 @@
+@@ -283,10 +397,23 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
          self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
              self.kv_cache_dtype, model_config
          )
@@ -221,7 +226,7 @@
          set_default_quant_scales(self, register_buffer=True)
  
          self.attn_backend = Qwen4ExpQSAFlashAttentionBackend
-@@ -433,6 +555,137 @@
+@@ -427,9 +554,140 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
          return output
  
  
@@ -249,6 +254,11 @@
 +    ``strict=False`` permits a deliberate subset; omitted layers keep the
 +    vLLM default scale of 1.0. Unknown names and non-scalar values are always
 +    errors.
++
++    Pipeline-parallel ranks hold only their stage's QSA layers. Sidecar keys
++    matching ``.layers.N.self_attn.attn`` that are not on this rank are
++    pipeline-stage siblings: logged and ignored. ``strict`` then requires an
++    entry for every *local* QSA layer.
 +    """
 +
 +    path = Path(sidecar_path)
@@ -266,8 +276,7 @@
 +        qsa_layers = {
 +            name: layer
 +            for name, layer in layers.items()
-+            if isinstance(name, str)
-+            and isinstance(layer, Qwen4ExpQSAAttention)
++            if isinstance(name, str) and isinstance(layer, Qwen4ExpQSAAttention)
 +        }
 +
 +    if not qsa_layers:
@@ -292,12 +301,11 @@
 +    # strict coverage guarantee that actually protects this rank is the
 +    # `missing` check below -- every local QSA layer must have an entry.
 +    stage_siblings = sorted(
-+        name for name in unknown if re.search(r"\.layers\.\d+\.self_attn\.attn$", name)
++        name
++        for name in unknown
++        if re.search(r"\.layers\.\d+\.self_attn\.attn$", name)
 +    )
-+    truly_unknown = sorted(
-+        name for name in unknown
-+        if name not in stage_siblings
-+    )
++    truly_unknown = sorted(name for name in unknown if name not in stage_siblings)
 +    if truly_unknown:
 +        raise ValueError(f"Unknown QSA layer names in {path}: {truly_unknown}")
 +    if stage_siblings:
@@ -320,22 +328,16 @@
 +        if not isinstance(entry, dict):
 +            raise ValueError(f"{layer_name} scales must be a JSON object")
 +        if set(entry) != {"k_scale", "v_scale"}:
-+            raise ValueError(
-+                f"{layer_name} must contain exactly k_scale and v_scale"
-+            )
++            raise ValueError(f"{layer_name} must contain exactly k_scale and v_scale")
 +
 +        values: list[float] = []
 +        for field in ("k_scale", "v_scale"):
 +            value = entry[field]
 +            if type(value) not in (int, float):
-+                raise ValueError(
-+                    f"{layer_name}.{field} must be a scalar JSON number"
-+                )
++                raise ValueError(f"{layer_name}.{field} must be a scalar JSON number")
 +            scale = float(value)
 +            if not math.isfinite(scale) or scale <= 0.0:
-+                raise ValueError(
-+                    f"{layer_name}.{field} must be finite and positive"
-+                )
++                raise ValueError(f"{layer_name}.{field} must be finite and positive")
 +            values.append(scale)
 +
 +        layer = qsa_layers[layer_name]
@@ -356,13 +358,12 @@
 +    return sorted(validated)
 +
 +
- def qwen4_exp_qsa_with_output(
-     hidden_states: torch.Tensor,
-     positions: torch.Tensor,
-@@ -483,5 +736,6 @@
+ __all__ = [
+     "QSAIndexer",
      "Qwen4ExpQSAAttention",
      "Qwen4ExpQSAFlashAttentionBackend",
      "Qwen4ExpQSAFlashAttentionImpl",
++    "_is_qsa_fp8_cache_dtype",
++    "_validated_qsa_fp8_dtype",
 +    "load_qsa_static_kv_scales",
-     "qwen4_exp_qsa_with_output",
  ]

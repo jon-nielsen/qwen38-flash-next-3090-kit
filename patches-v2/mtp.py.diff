@@ -1,25 +1,8 @@
+diff --git a/vllm/models/qwen4_exp/nvidia/mtp.py b/vllm/models/qwen4_exp/nvidia/mtp.py
+index 49d7903915..0f08a0a522 100644
 --- a/vllm/models/qwen4_exp/nvidia/mtp.py
-+++ b/overlay-fp8/mtp.py
-@@ -133,23 +133,37 @@
-                 _remap_ignored_layers(exclude_modules, mtp_start_layer_idx),
-             )
-         # compressed-tensors keeps its ignore list under `.ignore` as regex
--        # patterns. Checkpoints that leave MTP in bf16 (e.g. AWQ W4A16 exports,
--        # whose quantization_config ignores `re:.*mtp\..*`) provide no packed
--        # weights for the draft, so extend the ignore list to the draft's
--        # layer indices to keep the whole draft unquantized.
-+        # patterns. Checkpoints that leave the whole MTP draft in bf16 (e.g.
-+        # AWQ W4A16 exports, whose quantization_config ignores `re:.*mtp\..*`)
-+        # provide no packed weights for the draft, so extend the ignore list
-+        # to the draft's layer indices to keep the whole draft unquantized.
-+        # BUT: checkpoints that pack the draft's routed experts deliberately
-+        # EXCLUDE them from the ignore list with a negative lookahead
-+        # (halt95-style `re:^mtp\.(?!layers\.\d+\.mlp\.experts(?:\.|$)).*`).
-+        # Probe a canonical draft-expert module name against the patterns:
-+        # only take the unquantized-draft path when the experts themselves
-+        # are ignored; otherwise leave the ignore list alone so the packed
-+        # draft experts load quantized (upstream semantics).
-         ct_ignore = getattr(draft_quant_config, "ignore", None)
++++ b/vllm/models/qwen4_exp/nvidia/mtp.py
+@@ -162,15 +162,26 @@ def _make_draft_vllm_config(
          if isinstance(ct_ignore, list) and any(
              "mtp" in pattern for pattern in ct_ignore
          ):
@@ -32,6 +15,10 @@
 -            draft_quant_config.ignore = ct_ignore + [
 -                pattern for pattern in extra_ignores if pattern not in ct_ignore
 -            ]
++            # Probe a canonical draft-expert name against the ignore regexes.
++            # Merlin-style negative lookahead keeps packed INT4 draft experts
++            # quantized; only extend ignore when those experts are themselves
++            # ignored (AWQ catch-all `re:.*mtp\..*`).
 +            draft_expert_probe = "mtp.layers.0.mlp.experts.0.gate_proj"
 +            experts_ignored = any(
 +                (pattern.startswith("re:") and re.search(pattern[3:], draft_expert_probe))

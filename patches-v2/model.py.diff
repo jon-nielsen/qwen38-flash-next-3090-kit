@@ -1,0 +1,78 @@
+diff --git a/vllm/models/qwen4_exp/nvidia/model.py b/vllm/models/qwen4_exp/nvidia/model.py
+index 28c3ea69d1..ba6a16e7e9 100644
+--- a/vllm/models/qwen4_exp/nvidia/model.py
++++ b/vllm/models/qwen4_exp/nvidia/model.py
+@@ -8,8 +8,10 @@ from itertools import islice
+ import torch
+ from torch import nn
+ 
++from vllm import envs
+ from vllm.config import VllmConfig
+ from vllm.distributed import get_pp_group
++from vllm.logger import init_logger
+ from vllm.model_executor.layers.fused_moe.utils import (
+     is_model_fused_shared_expert_compatible,
+ )
+@@ -79,7 +81,9 @@ from ..config import Qwen4ExpConfig
+ from .hyperconnection import GatedResidual, HyperConnectionConfig
+ from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
+ from .ple_layer import Qwen4ExpPLELayer
+-from .qsa import Qwen4ExpQSAAttention
++from .qsa import Qwen4ExpQSAAttention, load_qsa_static_kv_scales
++
++logger = init_logger(__name__)
+ 
+ 
+ def without_modelopt_fp4(
+@@ -629,6 +633,29 @@ class Qwen4ExpModel(nn.Module):
+         return loaded
+ 
+ 
++def _maybe_load_qsa_static_kv_scales(model: nn.Module) -> None:
++    """Apply a static QSA K/V scale sidecar when VLLM_QSA_KV_SCALES names one.
++
++    ``load_qsa_static_kv_scales()`` must run after checkpoint weights are
++    loaded and before profiling, warmup, or cudagraph capture. Unset env var
++    is an exact no-op. Set but unusable: the exception propagates rather than
++    being swallowed, so a requested calibration cannot silently fail.
++    """
++    path = (envs.VLLM_QSA_KV_SCALES or "").strip()
++    if not path:
++        return
++    # strict: every local QSA layer of the target model must be in the sidecar.
++    applied = load_qsa_static_kv_scales(model, path, strict=True)
++    shown = ", ".join(sorted(applied)[:4])
++    logger.info(
++        "Qwen4Exp QSA: applied static K/V scales from %s to %d layer(s): %s%s",
++        path,
++        len(applied),
++        shown,
++        " ..." if len(applied) > 4 else "",
++    )
++
++
+ class Qwen4ExpForCausalLM(
+     nn.Module,
+     HasInnerState,
+@@ -855,7 +882,9 @@ class Qwen4ExpForCausalLM(
+             self,
+             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
+         )
+-        return loader.load_weights(weights, mapper=mapper)
++        loaded = loader.load_weights(weights, mapper=mapper)
++        _maybe_load_qsa_static_kv_scales(self)
++        return loaded
+ 
+ 
+ class Qwen4ExpProcessingInfo(Qwen3VLProcessingInfo):
+@@ -1050,7 +1079,9 @@ class Qwen4ExpForConditionalGeneration(
+             self,
+             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
+         )
+-        return loader.load_weights(weights, mapper=mapper)
++        loaded = loader.load_weights(weights, mapper=mapper)
++        _maybe_load_qsa_static_kv_scales(self)
++        return loaded
+ 
+     @classmethod
+     def get_mamba_state_dtype_from_config(

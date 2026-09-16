@@ -1,0 +1,291 @@
+diff --git a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+index 519a49aea9..1ccdb83bf8 100644
+--- a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
++++ b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+@@ -10,6 +10,7 @@ import torch
+ import torch.nn.functional as F
+ from torch import nn
+ 
++import vllm.envs as envs
+ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+ from vllm.config import get_current_vllm_config
+ from vllm.distributed import get_dp_group, get_etp_group, get_tp_group
+@@ -23,6 +24,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
+     CompressedTensorsConfig,
+ )
+ from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
++    find_matched_target,
+     should_ignore_layer,
+ )
+ from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+@@ -54,6 +56,28 @@ from .ops.ple import ple_ngram_ids
+ 
+ logger = init_logger(__name__)
+ 
++# Triton storage codes for the pinned-host lookup. E4M3 is always a uint8 view
++# so the kernel never receives an fp8e4nv pointer (illegal on sm80/sm86).
++_PLE_WEIGHT_DTYPE_NATIVE = 0
++_PLE_WEIGHT_DTYPE_E4M3 = 1
++
++
++def _view_ple_weight_as_triton_storage(
++    weight: torch.Tensor,
++) -> tuple[torch.Tensor, int]:
++    """Return a Triton-legal storage view of a PLE table plus a dtype code.
++
++    E4M3 is always a uint8 view: Triton must never see an fp8e4nv pointer on
++    sm80/sm86. BF16 and other non-FP8 dtypes pass through unchanged
++    (``_PLE_WEIGHT_DTYPE_NATIVE``). Shape and strides are preserved because
++    ``float8_e4m3fn`` and ``uint8`` are both one byte.
++    """
++    if weight.dtype == torch.float8_e4m3fn:
++        return weight.view(torch.uint8), _PLE_WEIGHT_DTYPE_E4M3
++    if weight.dtype == torch.uint8:
++        return weight, _PLE_WEIGHT_DTYPE_E4M3
++    return weight, _PLE_WEIGHT_DTYPE_NATIVE
++
+ 
+ class Qwen4ExpPLEEmbedding(PLEVocabParallelEmbedding, ABC):
+     """ETP-sharded PLE table shared by device and pinned-host backends."""
+@@ -164,6 +188,31 @@ class Qwen4ExpPLEEmbedding(PLEVocabParallelEmbedding, ABC):
+         raise NotImplementedError
+ 
+ 
++def _compressed_tensors_quantizes_ple(
++    quant_config: CompressedTensorsConfig, prefix: str
++) -> bool:
++    """Whether a compressed-tensors config group explicitly targets the PLE table.
++
++    compressed-tensors exports (e.g. the AWQ W4A16 checkpoints) quantize
++    ``Linear``/``RoutedExperts`` targets only, so the embedding table stays in
++    the checkpoint dtype whether or not ``ignore`` lists it.
++    """
++    ignore = quant_config.ignore
++    fused_mapping = quant_config.packed_modules_mapping
++    if should_ignore_layer(
++        prefix, ignore=ignore, fused_mapping=fused_mapping
++    ) or should_ignore_layer(
++        f"{prefix}.shard_0", ignore=ignore, fused_mapping=fused_mapping
++    ):
++        return False
++    targets = list(quant_config.target_scheme_map)
++    module = nn.Embedding(1, 1)
++    return any(
++        find_matched_target(name, module, targets, fused_mapping) is not None
++        for name in (prefix, f"{prefix}.shard_0")
++    )
++
++
+ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
+     """Quantization interface shared by resident and pinned PLE tables."""
+ 
+@@ -177,6 +226,12 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
+         embedding_dtype: str | None = None,
+     ) -> "Qwen4ExpPLEEmbeddingMethod":
+         """Select the concrete PLE embedding format for a layer."""
++        # Opt-in FP8 PLE table for mixed checkpoints whose compressed-tensors
++        # ignore list covers PLE but the n-gram shards are float8_e4m3fn
++        # (no ple_embedding_dtype in config.json). Default off so stock AWQ
++        # ignored-PLE stays on the unquantized path.
++        if envs.VLLM_PLE_FP8_EMBEDDING:
++            return Qwen4ExpPLEFp8EmbeddingMethod()
+         if embedding_dtype == "float8_e4m3fn":
+             return Qwen4ExpPLEFp8EmbeddingMethod()
+         if quant_config is None:
+@@ -190,23 +245,13 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
+         ) and quant_config.is_layer_excluded(prefix):
+             return Qwen4ExpPLEUnquantizedEmbeddingMethod()
+         if isinstance(quant_config, CompressedTensorsConfig):
+-            # compressed-tensors exports (e.g. the AWQ W4A16 checkpoints) only
+-            # quantize Linear targets and list the PLE table under `ignore`,
+-            # so its shards stay in the checkpoint dtype.
+-            if should_ignore_layer(
+-                prefix,
+-                ignore=quant_config.ignore,
+-                fused_mapping=quant_config.packed_modules_mapping,
+-            ) or should_ignore_layer(
+-                f"{prefix}.shard_0",
+-                ignore=quant_config.ignore,
+-                fused_mapping=quant_config.packed_modules_mapping,
+-            ):
+-                return Qwen4ExpPLEUnquantizedEmbeddingMethod()
+-            raise NotImplementedError(
+-                "Qwen4Exp PLE embedding requires compressed-tensors checkpoints "
+-                f"to leave {prefix} unquantized (add it to `ignore`)."
+-            )
++            if _compressed_tensors_quantizes_ple(quant_config, prefix):
++                raise NotImplementedError(
++                    "Qwen4Exp PLE embedding does not support compressed-tensors "
++                    f"quantization of {prefix}; leave it unquantized (add it "
++                    "to `ignore`)."
++                )
++            return Qwen4ExpPLEUnquantizedEmbeddingMethod()
+         if not isinstance(quant_config, Fp8Config):
+             raise NotImplementedError(
+                 "Qwen4Exp PLE embedding does not support quantization config "
+@@ -378,6 +423,72 @@ class Qwen4ExpPLEDeviceEmbedding(Qwen4ExpPLEEmbedding):
+         )
+ 
+ 
++@triton.jit
++def _decode_e4m3_to_bf16(b):
++    # Shifting the 7 magnitude bits left by 7 lands the E4M3 exponent in the
++    # FP16 exponent field and the 3 mantissa bits at the top of the FP16
++    # mantissa field, giving the right number under the wrong exponent bias
++    # (E4M3 7 vs FP16 15). That is a constant factor of 2^8. E4M3 subnormals
++    # land on FP16 subnormals and the same factor renormalizes them, which is
++    # only true because sm_86 does not flush FP16 subnormals -- verified on
++    # device, not assumed (probes/e4m3_shiftmul_probe.py).
++    #
++    # Bit-exact against torch on all 254 finite codepoints: every E4M3 value
++    # fits in BF16's 7 mantissa bits, and x256 is exact in FP16.
++    #
++    # This replaced a branchless-but-long decoder (~18 ops, 8 nested selects)
++    # that sat in both the K and the V tile load and cost ~half of prefill
++    # throughput on sm_86.
++    #
++    # Overlay deviation: 0x7F/0xFF are NaN in e4m3fn but decode to +-480
++    # there (CUDA KV writer never emits them). PLE checkpoint tables can
++    # contain those codes, so after the proven finite arithmetic we map
++    # them to signed bf16 qNaN to match torch uint8.view(e4m3fn).to(bf16).
++    b = b.to(tl.uint16)
++    bits = ((b & 0x80) << 8) | ((b & 0x7F) << 7)
++    decoded = (bits.to(tl.uint16).to(tl.float16, bitcast=True) * 256.0).to(tl.bfloat16)
++    is_nan = (b & 0x7F) == 0x7F
++    nan_bits = ((b & 0x80) << 8) | 0x7FC0
++    nan_val = nan_bits.to(tl.uint16).to(tl.bfloat16, bitcast=True)
++    return tl.where(is_nan, nan_val, decoded)
++
++
++@triton.jit
++def _lookup_ple_fp8_embedding_from_pinned_kernel(
++    weight_ptr,
++    ids_ptr,
++    output_ptr,
++    embedding_dim,
++    tp_vocab_start,
++    tp_vocab_end,
++    BLOCK_D: tl.constexpr,
++):
++    """Look up TP-owned FP8 PLE rows through a uint8 CUDA view of pinned memory.
++
++    ``weight_ptr`` is a uint8 view of the e4m3fn table. Values are decoded to
++    bf16 inside the kernel so Triton never sees an 8-bit float pointer. The
++    unscaled decode is stored; ``dequantize`` still applies the global scale.
++    """
++    row_id = tl.program_id(0)
++    global_idx = tl.load(ids_ptr + row_id)
++    in_range = (global_idx >= tp_vocab_start) & (global_idx < tp_vocab_end)
++    local_idx = tl.where(in_range, global_idx - tp_vocab_start, 0)
++    offsets = tl.arange(0, BLOCK_D)
++    store_mask = offsets < embedding_dim
++    load_mask = store_mask & in_range
++    codes = tl.load(
++        weight_ptr + local_idx * embedding_dim + offsets,
++        mask=load_mask,
++        other=0,
++    )
++    values = _decode_e4m3_to_bf16(codes)
++    tl.store(
++        output_ptr + row_id * embedding_dim + offsets,
++        values,
++        mask=store_mask,
++    )
++
++
+ @triton.jit
+ def _lookup_ple_embedding_from_pinned_kernel(
+     weight_ptr,
+@@ -440,13 +551,24 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
+             data_parallel_rank=data_parallel_rank,
+         )
+         self._uva_weight = get_accelerator_view_from_cpu_tensor(self.weight)
++        self._uva_weight_storage, self._weight_storage_dtype = (
++            _view_ple_weight_as_triton_storage(self._uva_weight)
++        )
+         self._block_d = triton.next_power_of_2(self.embedding_dim)
+         self._prefetch_stream = torch.cuda.Stream(device=self._uva_weight.device)
++        # FP8 tables are decoded to BF16 inside the lookup kernel (sm86 cannot
++        # compile fp8e4nv pointers). The unscaled decode is what dequantize
++        # later multiplies by the global scale.
++        self._lookup_output_dtype = (
++            torch.bfloat16
++            if self._weight_storage_dtype == _PLE_WEIGHT_DTYPE_E4M3
++            else self.weight.dtype
++        )
+         self._prefetch_buffer = torch.empty(
+             max_total_tokens * self.etp_data_parallel_size,
+             num_ngram_heads,
+             self.embedding_dim,
+-            dtype=self.weight.dtype,
++            dtype=self._lookup_output_dtype,
+             device=self._uva_weight.device,
+         )
+         self._output_dim = num_ngram_heads * self.embedding_dim
+@@ -471,35 +593,52 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
+         input_ids: torch.Tensor,
+         output: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+-        """Look up local ETP rows while preserving the weight storage dtype."""
++        """Look up local ETP rows through the CUDA view of pinned host memory.
++
++        BF16 (and other native) tables keep the v0.13.0 kernel and output
++        dtype. FP8 tables are passed as a uint8 view and decoded to BF16
++        inside the kernel; the global scale is still applied by dequantize.
++        """
+         expected_shape = (*input_ids.shape, self.embedding_dim)
++        output_dtype = self._lookup_output_dtype
+         if output is None:
+             output = torch.empty(
+                 expected_shape,
+-                dtype=self.weight.dtype,
++                dtype=output_dtype,
+                 device=input_ids.device,
+             )
+         elif (
+             tuple(output.shape) != expected_shape
+-            or output.dtype != self.weight.dtype
++            or output.dtype != output_dtype
+             or output.device != input_ids.device
+         ):
+             raise ValueError(
+-                "PLE prefetch output must match the input shape, weight dtype, "
+-                "and input device"
++                "PLE prefetch output must match the input shape, lookup "
++                "output dtype, and input device"
+             )
+ 
+         flat_ids = input_ids.reshape(-1).long()
+         if flat_ids.numel():
+-            _lookup_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
+-                self._uva_weight,
+-                flat_ids,
+-                output,
+-                self.embedding_dim,
+-                self.shard_indices.org_vocab_start_index,
+-                self.shard_indices.org_vocab_end_index,
+-                BLOCK_D=self._block_d,
+-            )
++            if self._weight_storage_dtype == _PLE_WEIGHT_DTYPE_E4M3:
++                _lookup_ple_fp8_embedding_from_pinned_kernel[(flat_ids.numel(),)](
++                    self._uva_weight_storage,
++                    flat_ids,
++                    output,
++                    self.embedding_dim,
++                    self.shard_indices.org_vocab_start_index,
++                    self.shard_indices.org_vocab_end_index,
++                    BLOCK_D=self._block_d,
++                )
++            else:
++                _lookup_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
++                    self._uva_weight,
++                    flat_ids,
++                    output,
++                    self.embedding_dim,
++                    self.shard_indices.org_vocab_start_index,
++                    self.shard_indices.org_vocab_end_index,
++                    BLOCK_D=self._block_d,
++                )
+         return output
+ 
+     def _reduce_etp_embeddings(self, embeddings: torch.Tensor) -> torch.Tensor:

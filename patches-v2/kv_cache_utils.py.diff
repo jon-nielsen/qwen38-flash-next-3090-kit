@@ -1,0 +1,20 @@
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index e2e38ec5d5..14e494ba0d 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -1725,6 +1725,15 @@ def get_kv_cache_config_from_groups(
+ 
+     kv_cache_tensors = []
+     for group in kv_cache_groups:
++        if not group.layer_names:
++            # PP projection can leave an empty group (all of its layers live
++            # on another PP rank). Keep it: the scheduler's config keeps the
++            # group too, so block-table rows and group indices stay aligned
++            # across ranks. But emit no tensor for it — the retained global
++            # UniformTypeKVCacheSpecs still names non-local layers, and the
++            # tensor builder would rebuild a tensor that no group claims
++            # (StopIteration in allocate_kv_cache).
++            continue
+         group_spec = group.kv_cache_spec
+         layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
+         if isinstance(group_spec, UniformTypeKVCacheSpecs):
